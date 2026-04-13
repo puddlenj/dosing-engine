@@ -2953,9 +2953,17 @@ export function calculateSafeToSwim(
   const fcWaitHours = hoursUntilFCSafe(resultingFC, shockTime, isIndoor, input.cya);
   const fcWaitMinutes = fcWaitHours * 60;
 
-  // Also calculate when the full treatment sequence ends + 30 min
-  const treatmentSteps = Math.max(0, significantDoses.length - 1);
-  const treatmentEndMinutes = treatmentSteps * gapMinutes + 30;
+  // Also calculate when the full treatment sequence ends + 30 min.
+  // Sums the actual per-step waits via getWaitBetween — matches the
+  // no-shock path above. (Fixes pre-existing `gapMinutes is not defined`
+  // crash from an incomplete LSEye refactor — the constant was removed
+  // when the no-shock path migrated to per-step waits but this line
+  // wasn't updated.)
+  let treatmentSequenceMinutes = 0;
+  for (let i = 0; i < significantDoses.length - 1; i++) {
+    treatmentSequenceMinutes += getWaitBetween(significantDoses[i].chemical, significantDoses[i + 1].chemical, isSpa).minutes;
+  }
+  const treatmentEndMinutes = treatmentSequenceMinutes + 30;
 
   // Safe time is whichever is later: FC dropping below 5, treatment end + 30 min, or chemical load floor
   const fcSafeTime = new Date(shockTime.getTime() + fcWaitMinutes * 60000);

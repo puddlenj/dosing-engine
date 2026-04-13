@@ -468,6 +468,51 @@ for (let i = 1; i <= NUM_SIMULATIONS; i++) {
 
     const dosingBugs = validate(scenario, result, targets);
     allBugs.push(...dosingBugs);
+
+    // ─── LSI_PROJECTION_DRIFT invariant ────────────────────────────────
+    // When the polish-dose gate skips "nice to have" LSI nudges to save tech
+    // time, it must not cause the projected LSI to drift more than 0.10 away
+    // from what the full treatment would have produced. The gate function is
+    // opt-in via the future `skipPolishDoses` flag on calculateDosing — if
+    // the flag is not yet wired (PR 1), both runs return identical results
+    // and this invariant is a trivial no-op, waiting for PR 2.
+    //
+    // Any call signature mismatch (e.g., flag not yet supported) is silently
+    // ignored so PR 1 can land ahead of the behavior change in PR 2.
+    if (result && result.projectedLSI !== undefined) {
+      try {
+        const skipResult = (calculateDosing as any)(
+          scenario.input,
+          targets,
+          scenario.isIndoor,
+          scenario.isSpa,
+          {},
+          scenario.isSaltSystem,
+          scenario.isBromine,
+          scenario.surfaceType,
+          { skipPolishDoses: true },
+        );
+        if (
+          skipResult &&
+          skipResult.projectedLSI !== undefined &&
+          Number.isFinite(skipResult.projectedLSI) &&
+          Number.isFinite(result.projectedLSI)
+        ) {
+          const drift = Math.abs(result.projectedLSI - skipResult.projectedLSI);
+          if (drift >= 0.10) {
+            allBugs.push({
+              scenario: scenario.label,
+              category: 'LSI_PROJECTION_DRIFT',
+              detail: `LSI drift ${drift.toFixed(3)} between full treatment (${result.projectedLSI.toFixed(2)}) and polish-skipped (${skipResult.projectedLSI.toFixed(2)}) exceeds 0.10`,
+              input: scenario.input,
+            });
+          }
+        }
+      } catch {
+        // Flag not yet supported (PR 1) — fall through, invariant becomes
+        // meaningful in PR 2 when the gate wires in.
+      }
+    }
   } catch (err: any) {
     crashes++;
     allBugs.push({

@@ -15,7 +15,9 @@
     "src"
   ],
   "scripts": {
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "test": "tsx test/simulate.ts --quick",
+    "fuzz": "tsx test/simulate.ts"
   },
   "repository": {
     "type": "git",
@@ -24,6 +26,7 @@
   "license": "UNLICENSED",
   "private": false,
   "devDependencies": {
+    "tsx": "^4.21.0",
     "typescript": "^5.5.0"
   }
 }

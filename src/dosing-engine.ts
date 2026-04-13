@@ -75,6 +75,30 @@ export interface ValidationWarning {
   message: string;
 }
 
+// Tracks when the LSI optimizer chose NOT to apply a polish nudge because the
+// water was already in an acceptable state and the added tech time wasn't
+// worth the marginal LSI improvement. Surfaced in the UI so techs/customers
+// see what the engine chose not to do and why.
+export interface PolishSkip {
+  parameter: 'pH' | 'TA' | 'CH';
+  reason: string;
+  startingLSI: number;
+  projectedLSIWithDose: number;
+  projectedLSIWithoutDose: number;
+  estimatedMinutesSaved: number;
+}
+
+// Options bag on calculateDosing — keeps the positional API stable while
+// letting callers flip behavior flags without a breaking signature change.
+export interface CalculateDosingOptions {
+  // When true, the LSI optimizer runs `isPolishDoseWorthIt` before applying
+  // any pH/TA/CH nudge. If the polish fails the gate (water already
+  // acceptable, marginal LSI gain, etc.) the nudge is skipped and a
+  // PolishSkip record is added to the result. Opt-in so we can field-test
+  // before making it default-on.
+  skipPolishDoses?: boolean;
+}
+
 export interface IntermediateState {
   step: number;
   chemical: string;
@@ -102,6 +126,10 @@ export interface DosingResult {
   // any future tool) reads the SAME answer instead of re-implementing the logic.
   // Duration-only; callers render absolute times relative to their own completion moment.
   safeToSwim?: SafeToSwimResult;
+  // LSI-optimizer polish nudges that the gate function chose not to apply
+  // because the water was already acceptable. Empty/undefined when
+  // skipPolishDoses is false or no polish was ever considered.
+  polishSkips?: PolishSkip[];
 }
 
 export interface SafeToSwimResult {
@@ -1289,6 +1317,68 @@ function isSequestrant(chemical: string): boolean {
   return chemical.toLowerCase().includes('metal magnet') || chemical.toLowerCase().includes('sequestrant');
 }
 
+// ─── Polish Dose Gate ──────────────────────────────────────────────────────
+//
+// The LSI optimizer tries to nudge pH/TA/CH beyond what base chemistry
+// required, to shift projected LSI toward +0.10. That's useful when water
+// is drifting corrosive or scale-forming — but when the water is already
+// acceptable (|LSI| ≤ 0.30, parameter already in range), the nudge costs
+// tech on-site time with negligible benefit. This function is the gate:
+// returns `true` to keep the polish nudge, `false` to skip it.
+//
+// A skip ONLY happens when every safety condition below is met. The gate
+// defaults to "keep" whenever there's ambiguity — the cost of an
+// unnecessary nudge is 15-30 min of tech time; the cost of skipping a
+// needed one is bad chemistry. Bias heavily toward "keep."
+function isPolishDoseWorthIt(params: {
+  parameter: 'pH' | 'TA' | 'CH';
+  startingLSI: number;
+  projectedLSIWithDose: number;
+  projectedLSIWithoutDose: number;
+  parameterCurrentlyInRange: boolean;
+  surface: string;
+  isCoupledAcidPair: boolean;
+}): { keep: boolean; reason: string } {
+  // Hard no-go: coupled bicarb+acid pair. Bicarb is load-bearing for the
+  // acid TA math — skipping it lets acid overshoot TA low.
+  if (params.isCoupledAcidPair) {
+    return { keep: true, reason: 'coupled bicarb+acid pair is load-bearing' };
+  }
+
+  // Hard no-go: plaster/concrete with starting LSI already below -0.15.
+  // Extra margin because cumulative etching is cheap to avoid and
+  // expensive to remedy.
+  const isPlasterOrConcrete = params.surface === 'plaster' || params.surface === 'concrete';
+  if (isPlasterOrConcrete && params.startingLSI < -0.15) {
+    return { keep: true, reason: 'plaster/concrete with corrosive starting LSI — extra margin' };
+  }
+
+  // Hard no-go: parameter is out of range. Base chemistry needed it;
+  // optimizer tuning it further is part of the same treatment.
+  if (!params.parameterCurrentlyInRange) {
+    return { keep: true, reason: `${params.parameter} not yet in range` };
+  }
+
+  // Hard no-go: starting LSI is already outside ±0.30. The nudge is
+  // compensating for a real imbalance, not polishing.
+  if (Math.abs(params.startingLSI) > 0.30) {
+    return { keep: true, reason: `starting LSI ${params.startingLSI.toFixed(2)} outside ±0.30` };
+  }
+
+  // Hard no-go: the nudge would move LSI by ≥ 0.08. That's a meaningful
+  // chemistry change worth the time.
+  const lsiDelta = Math.abs(params.projectedLSIWithDose - params.projectedLSIWithoutDose);
+  if (lsiDelta >= 0.08) {
+    return { keep: true, reason: `polish would move LSI by ${lsiDelta.toFixed(3)} (≥0.08 threshold)` };
+  }
+
+  // All skip conditions met — skip the polish.
+  return {
+    keep: false,
+    reason: `${params.parameter} already in range, starting LSI ${params.startingLSI.toFixed(2)} acceptable, polish would only move LSI ${lsiDelta.toFixed(3)}`,
+  };
+}
+
 function isPhosphateRemover(chemical: string): boolean {
   return chemical.toLowerCase().includes('phosphate remover');
 }
@@ -1425,8 +1515,11 @@ export function calculateDosing(
   isSaltSystemOverride: boolean = false,
   isBromineOverride: boolean = false,
   surfaceType: string = 'vinyl',
+  options: CalculateDosingOptions = {},
 ): DosingResult | null {
   if (!input.poolVolume || input.poolVolume <= 0) return null;
+
+  const polishSkips: PolishSkip[] = [];
 
   const spa = isSpaOverride || isSpa(input);
   // Salt systems generate their own sanitizer — never treat as bromine system
@@ -2225,6 +2318,75 @@ export function calculateDosing(
     // Sort by smallest deviation first, then prefer pH > TA > CH
     levers.sort((a, b) => a.deviation - b.deviation || a.priority - b.priority);
 
+    // ─── Polish gate ────────────────────────────────────────────────────
+    // When caller set skipPolishDoses, ask isPolishDoseWorthIt() before
+    // applying the best lever. If the gate says skip, record it and clear
+    // the levers array so the application block below no-ops. The gate
+    // biases heavily toward "keep" — only skips when every safety condition
+    // is met.
+    if (options.skipPolishDoses && levers.length > 0) {
+      const best = levers[0];
+
+      // Is the starting reading for this lever's parameter already in range?
+      const targetRange =
+        best.param === 'pH' ? targets.pH :
+        best.param === 'TA' ? targets.alkalinity :
+        targets.calciumHardness;
+      const currentReading =
+        best.param === 'pH' ? input.pH :
+        best.param === 'TA' ? input.totalAlkalinity :
+        input.calciumHardness;
+      const parameterCurrentlyInRange =
+        currentReading >= targetRange.min && currentReading <= targetRange.max;
+
+      // Is this pH lever attached to a bicarb+acid coupled pair? Those are
+      // load-bearing and must never be skipped.
+      const phDoseAtBest = best.param === 'pH' ? doses[best.doseIdx] : null;
+      const isCoupledAcidPair =
+        phDoseAtBest?.secondaryAdjustment?.parameterName === 'Total Alkalinity';
+
+      // Compute projected LSI as if we applied the lever vs didn't.
+      // preliminary.lsi is the "without" baseline — the LSI the engine would
+      // produce with only base dosing, no optimizer. For "with," swap in the
+      // lever's solvedValue for its own parameter and re-run calculateLSI.
+      const projectedLSIWithoutDose = preliminary.lsi;
+      const withDoseInput = {
+        ...input,
+        pH: best.param === 'pH' ? best.solvedValue : preliminary.proj.pH,
+        totalAlkalinity: best.param === 'TA' ? best.solvedValue : preliminary.proj.totalAlkalinity,
+        calciumHardness: best.param === 'CH' ? best.solvedValue : preliminary.proj.calciumHardness,
+        cya: preliminary.proj.cya,
+      };
+      const projectedLSIWithDose = calculateLSI(withDoseInput, 'formula').lsi;
+
+      const gate = isPolishDoseWorthIt({
+        parameter: best.param,
+        startingLSI,
+        projectedLSIWithDose,
+        projectedLSIWithoutDose,
+        parameterCurrentlyInRange,
+        surface: surfaceType,
+        isCoupledAcidPair,
+      });
+
+      if (!gate.keep) {
+        polishSkips.push({
+          parameter: best.param,
+          reason: gate.reason,
+          startingLSI: round1(startingLSI),
+          projectedLSIWithDose: round1(projectedLSIWithDose),
+          projectedLSIWithoutDose: round1(projectedLSIWithoutDose),
+          // Conservative placeholder — polish nudges modify existing doses
+          // rather than adding new ones, so the true on-site savings depend
+          // on whether the CH back-off case removes a dose entirely. 15 min
+          // is the floor (per-chemical wait when two chems need separation).
+          estimatedMinutesSaved: 15,
+        });
+        // Short-circuit the optimization for this visit — no lever applied.
+        levers.length = 0;
+      }
+    }
+
     // Apply the gentlest lever
     if (levers.length > 0) {
       const best = levers[0];
@@ -2660,6 +2822,7 @@ export function calculateDosing(
     precipitationWarning,
     readingWarnings: readingWarnings.length > 0 ? readingWarnings : undefined,
     safeToSwim,
+    polishSkips: polishSkips.length > 0 ? polishSkips : undefined,
   };
 }
 

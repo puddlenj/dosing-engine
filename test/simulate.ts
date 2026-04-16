@@ -352,6 +352,31 @@ function validate(scenario: Scenario, result: DosingResult | null, targets: Dosi
       bug('POOL_PH_TOO_LOW', `Pool projected pH ${pv.pH} below profile min ${targets.pH.min} (was ${input.pH})`);
     }
 
+    // pH rescue: if input pH was meaningfully below profile min (not just 0.1
+    // under), the engine must make meaningful progress toward correction.
+    // Skip cases where a Partial Drain & Refill is prescribed — drain visits
+    // intentionally strip other doses and defer to post-refill retest.
+    const drainVisit = result.doses.some((d) => d.chemical === 'Partial Drain & Refill');
+    // 0.31 (not 0.30) avoids float-precision false positives when target.pH.min
+    // is 7.4 (7.4 - 0.3 evaluates to 7.1000000000000005 in JS).
+    const phRescueThreshold = 0.31; // only flag pH that is clearly corrosive
+    if (
+      !drainVisit &&
+      !scenario.isSpa &&
+      input.pH < targets.pH.min - phRescueThreshold &&
+      pv.pH < input.pH + 0.1
+    ) {
+      bug('POOL_PH_RESCUE_MISSED', `Pool pH ${input.pH} below min ${targets.pH.min} — projected pH ${pv.pH} shows no meaningful correction`);
+    }
+    if (
+      !drainVisit &&
+      scenario.isSpa &&
+      input.pH < 7.4 - phRescueThreshold &&
+      pv.pH < input.pH + 0.1
+    ) {
+      bug('SPA_PH_RESCUE_MISSED', `Spa pH ${input.pH} below 7.4 — projected pH ${pv.pH} shows no meaningful correction`);
+    }
+
     if (pv.totalAlkalinity < 0) bug('NEGATIVE_PROJECTED', `Projected TA is ${pv.totalAlkalinity}`);
     if (pv.calciumHardness < 0) bug('NEGATIVE_PROJECTED', `Projected CH is ${pv.calciumHardness}`);
     if (pv.cya < 0) bug('NEGATIVE_PROJECTED', `Projected CYA is ${pv.cya}`);

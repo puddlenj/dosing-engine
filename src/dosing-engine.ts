@@ -1551,7 +1551,7 @@ export function calculateDosing(
 
   // ─── Extreme Reading Warnings ─────────────────────────────────────────────
   // Flag readings that are far outside normal ranges so techs know what they're dealing with.
-  if (input.pH < 6.5) {
+  if (input.pH < 6.9) {
     readingWarnings.push(
       `pH is ${input.pH} — extremely low. Immediate correction needed to prevent equipment corrosion and surface damage. Add soda ash or sodium bicarbonate before other treatments.`
     );
@@ -1682,15 +1682,25 @@ export function calculateDosing(
   } else {
     // Standard independent dosing (no simultaneous TA up + pH down)
     const alkDose = doseAlkalinity(input.totalAlkalinity, targets.alkalinity, input.poolVolume, input.pH, spa, rates, targets.pH);
-    if (alkDose) doses.push(alkDose);
+    const aerationActive = alkDose?.chemical === 'Aeration';
+    // pH rescue: when pH is below profile min, aeration alone is too slow
+    // (days to weeks). The pool is actively corrosive right now — soda ash
+    // must be dosed even though it will push TA above target. TA can be
+    // brought back down on a follow-up visit once pH is safe.
+    const phRescueNeeded = input.pH < targets.pH.min;
+
+    // Normally push the alk dose. But when pH rescue is needed, drop the
+    // Aeration advisory — its "TA will drift to target" messaging would
+    // contradict the soda ash step that raises TA. TA correction happens
+    // next visit.
+    if (alkDose && !(aerationActive && phRescueNeeded)) doses.push(alkDose);
 
     if (!taUsedAcid) {
-      // If aeration is recommended (TA high, pH already low), skip soda ash —
-      // aeration raises pH naturally via CO₂ off-gassing. Adding soda ash would
-      // raise TA, defeating the purpose of the aeration step.
-      const aerationActive = alkDose?.chemical === 'Aeration';
+      // Only skip pH dosing when aeration is handling it (pH mildly low,
+      // TA high — aeration raises pH naturally). During pH rescue, dose soda ash.
+      const skipPHDose = aerationActive && !phRescueNeeded;
 
-      if (!aerationActive) {
+      if (!skipPHDose) {
         // Simple cross-effect: if bicarb raised TA, account for pH bump in acid dose
         const bicarbRaisedTA = alkDose && needsTAUp;
         const taIncrease = bicarbRaisedTA ? (alkDose.targetValue - alkDose.currentValue) : 0;
@@ -1700,6 +1710,12 @@ export function calculateDosing(
         const phDose = dosePH(effectivePH, targets.pH, input.poolVolume, spa, rates, input.totalAlkalinity);
         if (phDose) {
           if (phBumpFromBicarb > 0) phDose.currentValue = round1(effectivePH);
+          // If we dropped the Aeration step for pH rescue, annotate the soda ash
+          // dose so the tech knows TA will overshoot and needs a follow-up.
+          if (phRescueNeeded && aerationActive && input.totalAlkalinity > targets.alkalinity.max) {
+            phDose.safetyNote =
+              `${phDose.safetyNote ?? ''} pH is below minimum — soda ash takes priority over TA management. TA will rise above target; bring TA back to target on the next visit with acid plus aeration once pH is stable.`.trim();
+          }
           doses.push(phDose);
         }
       }
@@ -1996,7 +2012,15 @@ export function calculateDosing(
       if (dose.parameterName === 'Total Alkalinity') {
         for (let j = i + 1; j < doses.length; j++) {
           const later = doses[j];
-          if (later.parameterName === 'pH' && later.secondaryAdjustment?.parameterName === 'Total Alkalinity') {
+          // This "ease off acid" block only applies to acid doses (currentValue > targetValue).
+          // A soda ash dose with a TA secondaryAdjustment looks structurally similar but is
+          // raising pH, not lowering it — easing off would defeat the pH rescue.
+          const laterIsAcidDose = later.currentValue > later.targetValue;
+          if (
+            later.parameterName === 'pH' &&
+            later.secondaryAdjustment?.parameterName === 'Total Alkalinity' &&
+            laterIsAcidDose
+          ) {
             // Partial bicarb raises TA to intermediateTarget (not origTarget)
             // pH bump is proportionally smaller
             const partialBicarbPPM = intermediateTarget - dose.currentValue;
@@ -2428,9 +2452,12 @@ export function calculateDosing(
             purpose: oldDose.purpose.replace(/to [\d.]+/, `to ${best.solvedValue.toFixed(1)} (LSI-optimized)`),
           };
         } else if (!isAcidDose && best.solvedValue < oldDose.targetValue && best.solvedValue >= (oldDose.currentValue ?? input.pH)) {
-          // Ease off base: target lower pH → less soda ash → lower LSI (prevents scale-forming)
+          // Ease off base: target lower pH → less soda ash → lower LSI (prevents scale-forming).
+          // Floor at profile pH min — LSI optimization must not leave pH below safe range
+          // even if the solver says a lower pH is LSI-optimal.
+          const easedTarget = Math.max(best.solvedValue, targets.pH.min);
           const chemName = spa ? 'pH Up' : 'Soda Ash (Sodium Carbonate)';
-          const delta = best.solvedValue - (oldDose.currentValue ?? input.pH);
+          const delta = easedTarget - (oldDose.currentValue ?? input.pH);
           const baseDoses = Math.max(0, delta / 0.2);
           const newAmount = round1(baseDoses * r(rates, chemName, 6) * optScale);
 
@@ -2445,9 +2472,9 @@ export function calculateDosing(
           doses[idx] = {
             ...oldDose,
             amount: newAmount,
-            targetValue: round1(best.solvedValue),
+            targetValue: round1(easedTarget),
             secondaryAdjustment: updatedSecondary,
-            purpose: oldDose.purpose.replace(/to [\d.]+/, `to ${best.solvedValue.toFixed(1)} (LSI-optimized)`),
+            purpose: oldDose.purpose.replace(/to [\d.]+/, `to ${easedTarget.toFixed(1)} (LSI-optimized)`),
           };
         }
       }
@@ -2478,30 +2505,55 @@ export function calculateDosing(
           };
         }
 
-        // Recalculate acid dose if present (more bicarb → higher post-bicarb pH → more acid)
-        const acidIdx = doses.findIndex(d => d.parameterName === 'pH' && d.order === 2);
-        if (acidIdx >= 0) {
-          const phDose = doses[acidIdx];
+        // Recalculate the coupled pH dose if present. This block was written for
+        // bicarb+acid (TA up, pH down) coupling — recomputing acid amount for the
+        // new bicarb level. It must NOT touch a soda ash dose (currentValue <
+        // targetValue), which raises pH; running it through totalAcidDose would
+        // zero it out and leave pH uncorrected.
+        const coupledPHIdx = doses.findIndex(d => d.parameterName === 'pH' && d.order === 2);
+        if (coupledPHIdx >= 0) {
+          const phDose = doses[coupledPHIdx];
+          const phDoseIsAcid = phDose.currentValue > phDose.targetValue;
           const phBump = (newDelta / 10) * 0.05;
           const newEffectivePH = round1(input.pH + phBump);
-          const phDrop = newEffectivePH - targets.pH.ideal;
-          const acidDoses = phDrop / 0.2;
-          const newAcidAmount = spa
-            ? totalAcidDose(newEffectivePH, targets.pH.ideal, 'sb', best.solvedValue, optScale)
-            : totalAcidDose(newEffectivePH, targets.pH.ideal, 'ma', best.solvedValue, optScale);
-          const taLoss = Math.round((phDrop / 0.2) * 4);
-          const netTA = best.solvedValue - taLoss;
 
-          doses[acidIdx] = {
-            ...phDose,
-            amount: newAcidAmount,
-            currentValue: newEffectivePH,
-            secondaryAdjustment: phDose.secondaryAdjustment ? {
-              ...phDose.secondaryAdjustment,
-              currentValue: best.solvedValue,
-              targetValue: netTA,
-            } : undefined,
-          };
+          if (phDoseIsAcid) {
+            const phDrop = newEffectivePH - targets.pH.ideal;
+            const newAcidAmount = spa
+              ? totalAcidDose(newEffectivePH, targets.pH.ideal, 'sb', best.solvedValue, optScale)
+              : totalAcidDose(newEffectivePH, targets.pH.ideal, 'ma', best.solvedValue, optScale);
+            const taLoss = Math.round((phDrop / 0.2) * 4);
+            const netTA = best.solvedValue - taLoss;
+
+            doses[coupledPHIdx] = {
+              ...phDose,
+              amount: newAcidAmount,
+              currentValue: newEffectivePH,
+              secondaryAdjustment: phDose.secondaryAdjustment ? {
+                ...phDose.secondaryAdjustment,
+                currentValue: best.solvedValue,
+                targetValue: netTA,
+              } : undefined,
+            };
+          } else {
+            // Soda ash dose: recompute amount for the new post-bicarb starting pH.
+            // More bicarb → higher starting pH → less soda ash needed.
+            const SA = spa ? 'pH Up' : 'Soda Ash (Sodium Carbonate)';
+            const baseDelta = Math.max(0, phDose.targetValue - newEffectivePH);
+            const baseDoses = baseDelta / 0.2;
+            const newBaseAmount = round1(baseDoses * r(rates, SA, 6) * optScale);
+
+            doses[coupledPHIdx] = {
+              ...phDose,
+              amount: newBaseAmount,
+              currentValue: newEffectivePH,
+              secondaryAdjustment: phDose.secondaryAdjustment?.parameterName === 'Total Alkalinity' ? {
+                ...phDose.secondaryAdjustment,
+                currentValue: best.solvedValue,
+                targetValue: best.solvedValue + Math.round(baseDoses * 5),
+              } : phDose.secondaryAdjustment,
+            };
+          }
         }
         }
       }

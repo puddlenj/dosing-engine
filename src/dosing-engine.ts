@@ -1968,7 +1968,11 @@ export function calculateDosing(
     const limit = visitLimits[dose.chemical];
     if (!limit || dose.amount <= 0 || dose.skipVisitLimit || spa) continue;
 
-    const scaledLimit = round1(limit * scale);
+    // Absolute ceiling overrides the per-10k scaled limit for specific chemicals.
+    // Calcium Chloride: 10 lbs max per visit regardless of pool size, and no return-visit carryover.
+    const isCalciumChloride = dose.chemical === 'Calcium Chloride (100%)';
+    const absoluteCap = isCalciumChloride ? 10 : Infinity;
+    const scaledLimit = Math.min(round1(limit * scale), absoluteCap);
     if (dose.amount > scaledLimit) {
       const ratio = scaledLimit / dose.amount;
       const remainder = round1(dose.amount - scaledLimit);
@@ -1981,18 +1985,20 @@ export function calculateDosing(
         ? round1(origCurrent + delta * ratio)
         : Math.round(origCurrent + delta * ratio);
 
-      // Return visit dose = remainder
-      returnVisitDoses.push({
-        ...dose,
-        amount: remainder,
-        currentValue: intermediateTarget,
-        targetValue: origTarget,
-        purpose: dose.purpose.replace(`from ${origCurrent}`, `from ~${intermediateTarget}`),
-        alternatives: dose.alternatives?.map(alt => ({
-          ...alt,
-          amount: alt.amount > 0 ? round1(alt.amount * (1 - ratio)) : 0,
-        })),
-      });
+      // Return visit dose = remainder (skipped for hard-capped chemicals like CaCl)
+      if (!isCalciumChloride) {
+        returnVisitDoses.push({
+          ...dose,
+          amount: remainder,
+          currentValue: intermediateTarget,
+          targetValue: origTarget,
+          purpose: dose.purpose.replace(`from ${origCurrent}`, `from ~${intermediateTarget}`),
+          alternatives: dose.alternatives?.map(alt => ({
+            ...alt,
+            amount: alt.amount > 0 ? round1(alt.amount * (1 - ratio)) : 0,
+          })),
+        });
+      }
 
       // Cap this visit
       doses[i] = {

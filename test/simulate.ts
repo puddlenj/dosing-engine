@@ -294,7 +294,13 @@ function validate(scenario: Scenario, result: DosingResult | null, targets: Dosi
   if (!hasDrain && result.projectedLSI !== undefined) {
     const startingLSI = calculateLSI(input, 'formula').lsi;
     const engineKnows = result.validationWarnings?.some(w => w.parameter === 'LSI');
-    const tolerance = engineKnows ? 0.60 : 0.10; // relax if engine already warned user
+    // Relax further when input pH is critical (< 7.1 or > 8.5) — pH rescue is
+    // non-negotiable and can swing LSI 0.7+ when TA/CH are also out of range.
+    // The engine's emitting both a validationWarning and a precipitationWarning
+    // in those cases; the harness shouldn't double-count what the engine
+    // already flagged.
+    const phRescueActive = input.pH < 7.1 || input.pH > 8.5;
+    const tolerance = engineKnows ? (phRescueActive ? 0.85 : 0.60) : 0.10;
     if (Math.abs(result.projectedLSI) > Math.abs(startingLSI) + tolerance) {
       bug('LSI_WORSENED', `|projected LSI| (${Math.abs(result.projectedLSI).toFixed(2)}) > |starting LSI| (${Math.abs(startingLSI).toFixed(2)}) + ${tolerance} — treatment made water worse${engineKnows ? ' (engine warned but exceeded relaxed tolerance)' : ''}`);
     }

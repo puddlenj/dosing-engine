@@ -2674,6 +2674,80 @@ export function calculateDosing(
     }
   }
 
+  // ─── LSI Safety Guard ───────────────────────────────────────────────────
+  // The LSI optimizer fights to bring projected LSI toward balance, but when
+  // visit-cap walls (e.g., 10 lb CaCl absolute) prevent matching pH/CH moves,
+  // the optimizer hits a wall and the engine ships a plan that pushes water
+  // FURTHER from balance than where it started. Common pattern: high pH +
+  // very low CH on a cold pool — acid drops pH but CaCl can't raise CH
+  // enough in one visit, leaving water corrosive.
+  //
+  // Guard: after the optimizer, if projected LSI is meaningfully outside the
+  // safe band (-0.3..+0.3) AND removing the pH dose would bring it closer to
+  // balance, defer that dose to the return visit. Customer's water sits at
+  // imperfect pH for a week, but stays in a non-corrosive / non-scaling state.
+  {
+    const SAFE_LO = -0.3;
+    const SAFE_HI = 0.3;
+    const distFromSafe = (lsi: number) =>
+      lsi < SAFE_LO ? SAFE_LO - lsi : lsi > SAFE_HI ? lsi - SAFE_HI : 0;
+
+    const postOpt = computeProjected(doses);
+    const currentDist = distFromSafe(postOpt.lsi);
+
+    // pH safety overrides LSI optimization. When input pH is itself dangerous,
+    // shipping the pH correction is non-negotiable — even if it pushes LSI
+    // scale-forming or corrosive, the alternative (leaving pH at 7.0 or 8.6
+    // for another week) is worse for surfaces and sanitation. The 7.1 threshold
+    // matches the fuzz harness's pH-rescue trigger so the guard and the harness
+    // agree on what counts as "critical."
+    const PH_CRITICALLY_LOW = 7.1;
+    const PH_CRITICALLY_HIGH = 8.5;
+
+    if (currentDist > 0.1) {
+      // Find a pH-correction dose to try removing. Either a primary pH dose
+      // (acid or soda ash) or a bicarb dose whose secondary is pushing pH up.
+      const phPrimaryIdx = doses.findIndex(d => d.parameterName === 'pH' && d.amount > 0);
+      const bicarbIdx = doses.findIndex(d =>
+        d.parameterName === 'Total Alkalinity' &&
+        d.amount > 0 &&
+        d.secondaryAdjustment?.parameterName === 'pH'
+      );
+      // Prefer deferring the primary pH dose if present; otherwise the bicarb dose
+      // (only when LSI was driven scale-forming by bicarb's pH bump).
+      const deferIdx =
+        phPrimaryIdx >= 0 ? phPrimaryIdx :
+        (postOpt.lsi > SAFE_HI && bicarbIdx >= 0 ? bicarbIdx : -1);
+
+      // Don't defer if the dose is rescuing critically dangerous starting pH.
+      const candidate = deferIdx >= 0 ? doses[deferIdx] : null;
+      const isPhUpDose = candidate ? candidate.currentValue < candidate.targetValue : false;
+      const isPhDownDose = candidate ? candidate.currentValue > candidate.targetValue : false;
+      const skipForPHSafety =
+        (isPhUpDose && input.pH < PH_CRITICALLY_LOW) ||
+        (isPhDownDose && input.pH > PH_CRITICALLY_HIGH);
+
+      if (deferIdx >= 0 && !skipForPHSafety) {
+        const candidateDoses = doses.filter((_, i) => i !== deferIdx);
+        const candidate = computeProjected(candidateDoses);
+        const candidateDist = distFromSafe(candidate.lsi);
+
+        if (candidateDist < currentDist - 0.15) {
+          const deferredDose = doses[deferIdx];
+          doses.splice(deferIdx, 1);
+          returnVisitDoses.push({
+            ...deferredDose,
+            safetyNote: (deferredDose.safetyNote ? deferredDose.safetyNote + ' ' : '') +
+              `Deferred — single-visit ${deferredDose.parameterName.toLowerCase()} correction would push LSI to ${postOpt.lsi.toFixed(2)} (outside safe -0.3/+0.3 band). Bring calcium up first this visit; complete this dose next visit once water can absorb the change without going corrosive or scale-forming.`,
+          });
+          readingWarnings.push(
+            `${deferredDose.parameterName} correction deferred to return visit. Single-visit treatment would push LSI to ${postOpt.lsi.toFixed(2)}; deferring brings projected LSI to ${candidate.lsi.toFixed(2)}. Pool sits at imperfect ${deferredDose.parameterName.toLowerCase()} for the week but stays out of corrosive/scaling territory.`
+          );
+        }
+      }
+    }
+  }
+
   // ─── Intermediate State Simulation ──────────────────────────────────────
   // Walk through the dose sequence step-by-step, computing LSI after each
   // chemical addition. If any intermediate state is highly scale-forming

@@ -627,12 +627,6 @@ function doseAlkalinity(
         currentValue: currentPH,
         targetValue: acidPHTarget,
         parameterName: 'pH',
-        // TODO: when the visit-limit splitter learns to scale secondaryAdjustment
-        // proportionally, drop skipVisitLimit so extreme acid corrections split
-        // across visits. Until then, bypass — without it, the splitter caps the
-        // dose but leaves the TA secondary projecting the full drop, lying to
-        // techs about visit results.
-        skipVisitLimit: true,
         secondaryAdjustment: {
           parameterName: 'Total Alkalinity',
           currentValue: current,
@@ -655,9 +649,6 @@ function doseAlkalinity(
       currentValue: currentPH,
       targetValue: acidPHTarget,
       parameterName: 'pH',
-      // TODO: same as the spa branch above — drop skipVisitLimit once the
-      // splitter scales secondaryAdjustment for split doses.
-      skipVisitLimit: true,
       secondaryAdjustment: {
         parameterName: 'Total Alkalinity',
         currentValue: current,
@@ -2037,6 +2028,25 @@ export function calculateDosing(
         ? round1(origCurrent + delta * ratio)
         : Math.round(origCurrent + delta * ratio);
 
+      // When a dose has a secondaryAdjustment (e.g., acid → primarily pH, also
+      // drops TA), the side effect is proportional to how much chemical we
+      // actually added. Capping the dose to half means the side effect is half
+      // too. Without scaling here, the dose record claims the full secondary
+      // drop even though only half the chemical landed.
+      const secOrig = dose.secondaryAdjustment;
+      const secDelta = secOrig ? secOrig.targetValue - secOrig.currentValue : 0;
+      const secIntermediate = secOrig
+        ? (secOrig.parameterName === 'pH'
+            ? round1(secOrig.currentValue + secDelta * ratio)
+            : Math.round(secOrig.currentValue + secDelta * ratio))
+        : 0;
+      const thisVisitSecondary = secOrig
+        ? { ...secOrig, targetValue: secIntermediate }
+        : undefined;
+      const returnVisitSecondary = secOrig
+        ? { ...secOrig, currentValue: secIntermediate, targetValue: secOrig.targetValue }
+        : undefined;
+
       // Return visit dose = remainder (skipped for hard-capped chemicals like CaCl)
       if (!isCalciumChloride) {
         returnVisitDoses.push({
@@ -2049,6 +2059,7 @@ export function calculateDosing(
             ...alt,
             amount: alt.amount > 0 ? round1(alt.amount * (1 - ratio)) : 0,
           })),
+          secondaryAdjustment: returnVisitSecondary,
         });
       }
 
@@ -2062,6 +2073,7 @@ export function calculateDosing(
           ...alt,
           amount: alt.amount > 0 ? round1(alt.amount * ratio) : 0,
         })),
+        secondaryAdjustment: thisVisitSecondary,
       };
 
       // When a bicarb dose is split (simultaneous TA+pH path), the coupled acid dose

@@ -1,5 +1,6 @@
 import type { WaterTestInput } from './lsi-calculator';
 import { calculateLSI, getCyaCorrectionFactor, getCarbonateAlkalinity } from './lsi-calculator';
+import { buildTargets, type SurfaceType } from './chemistry-targets';
 
 // ─── Types ───────────────────────────────────────────────────────────────────
 
@@ -188,6 +189,18 @@ export const FALLBACK_RATES: DosingRateMap = {
   'Metal Magnet (Sequestrant)':                { dose_per_10k: 32,   dose_unit: 'fl oz', visit_limit_per_10k: null }, // Manufacturer label (initial dose 32 oz/10k gal)
   'Pool Salt':                                 { dose_per_10k: 30,   dose_unit: 'lbs',   visit_limit_per_10k: 100 }, // SU Pool Care Handbook: 267 lbs/10k = 0→3200; 30/360
 };
+
+// Hard ceiling on Calcium Chloride per visit, regardless of pool size.
+// Tech preference / handling safety — pre-dissolving more than 10 lbs in a single
+// visit is impractical. Remainder is dropped (not deferred) so we don't cap-and-
+// schedule a 30-lb dose across three weekly visits.
+const CACL_ABSOLUTE_CAP_LBS = 10;
+
+// Salt reading at or above this is treated as evidence of a salt system even when
+// the caller's `is_salt_system` flag is false. Spintouch in non-salt pools usually
+// reads <300 ppm; >=500 indicates either a real SWG (possibly depleted) or a pool
+// with very high TDS — both worth flagging and dosing as salt-flavored.
+const SALT_AUTO_DETECT_THRESHOLD = 500;
 
 // ─── Fill Water Defaults (Monmouth County NJ municipal water) ────────────────
 // Source: Joint Water Commission 2025/2026 water quality reports
@@ -1084,9 +1097,10 @@ function doseSalt(
   rates: DosingRateMap,
   isSaltPool: boolean = false,
 ): ChemicalDose | null {
-  // Only recommend if this is a salt pool — either salt reading >= 1000 or explicitly flagged
+  // Only recommend if this is a salt pool — caller already resolved isSaltPool,
+  // local guard catches uncovered call paths.
   if (current === undefined) return null;
-  if (!isSaltPool && current < 1000) return null;
+  if (!isSaltPool && current < SALT_AUTO_DETECT_THRESHOLD) return null;
   if (current >= target.min) return null;
 
   const scale = volumeGallons / 10000;
@@ -1530,6 +1544,22 @@ export function calculateDosing(
   const returnVisitDoses: ChemicalDose[] = [];
   const readingWarnings: string[] = [];
 
+  // ─── Salt auto-detection ────────────────────────────────────────────────
+  // Trust the caller's flag if set, otherwise infer from the salt reading.
+  // When auto-detected, overlay salt-flavored targets so dosing matches an SWG
+  // pool (lower TA, salt-cell-safe CH, salt addition recommendation).
+  const saltReading = input.salt ?? 0;
+  const detectedSalt = saltReading >= SALT_AUTO_DETECT_THRESHOLD;
+  const isSaltPool = isSaltSystemOverride || detectedSalt;
+
+  if (detectedSalt && !isSaltSystemOverride) {
+    const validSurface: SurfaceType =
+      surfaceType === 'plaster' || surfaceType === 'vinyl' || surfaceType === 'fiberglass'
+        ? (surfaceType as SurfaceType)
+        : 'vinyl';
+    targets = buildTargets(spa, validSurface, true);
+  }
+
   // ─── LSI-First Target Adjustment (Orenda: "LSI first, range chemistry second") ──
   // Before individual dosing, check if the profile's ideal targets produce balanced
   // LSI. If not, adjust CH ideal (foundation, no cross-effects) and TA ideal so
@@ -1581,9 +1611,13 @@ export function calculateDosing(
     );
   }
 
-  // ─── Salt Cell Scaling Advisory ─────────────────────────────────────────────
-  const isSaltSystem = input.salt ? input.salt >= 1000 : false;
-  if (isSaltSystem && startingLSI > -0.1 && input.calciumHardness > 300) {
+  // ─── Salt System Advisories ─────────────────────────────────────────────
+  if (detectedSalt && !isSaltSystemOverride) {
+    readingWarnings.push(
+      `Salt reading is ${saltReading} ppm — treating this as a salt pool. Targets and salt dose are calibrated for SWG operation. If this is a non-salt pool with elevated TDS, set the salt-system flag to off and recalculate.`
+    );
+  }
+  if (isSaltPool && startingLSI > -0.1 && input.calciumHardness > 300) {
     readingWarnings.push(
       `Salt pool with positive LSI (+${round1(startingLSI)}) and CH ${input.calciumHardness} ppm — elevated salt cell scaling risk. Water temperature at the cell electrode is much higher than bulk water, accelerating calcium carbonate deposits. Inspect cell for scale buildup.`
     );
@@ -1765,7 +1799,6 @@ export function calculateDosing(
   //
   // Use post-drain CYA for FC targeting: if we're draining to lower CYA,
   // the FC target should be based on the CYA level AFTER the drain.
-  const isSaltPool = isSaltSystemOverride || (input.salt ?? 0) >= 1000;
   const cyaDrainDose = doses.find(d => d.chemical === 'Partial Drain & Refill' && d.parameterName === 'CYA (Stabilizer)');
   const effectiveCYA = cyaDrainDose ? cyaDrainDose.targetValue : input.cya;
   const shockDose = doseShock(input, targets.combinedChlorine, input.poolVolume, spa, bromineSystem, rates, surfaceType, isSaltPool, targets.calciumHardness);
@@ -1969,9 +2002,9 @@ export function calculateDosing(
     if (!limit || dose.amount <= 0 || dose.skipVisitLimit || spa) continue;
 
     // Absolute ceiling overrides the per-10k scaled limit for specific chemicals.
-    // Calcium Chloride: 10 lbs max per visit regardless of pool size, and no return-visit carryover.
+    // Calcium Chloride: hard-capped per visit regardless of pool size, and no return-visit carryover.
     const isCalciumChloride = dose.chemical === 'Calcium Chloride (100%)';
-    const absoluteCap = isCalciumChloride ? 10 : Infinity;
+    const absoluteCap = isCalciumChloride ? CACL_ABSOLUTE_CAP_LBS : Infinity;
     const scaledLimit = Math.min(round1(limit * scale), absoluteCap);
     if (dose.amount > scaledLimit) {
       const ratio = scaledLimit / dose.amount;
@@ -2322,11 +2355,19 @@ export function calculateDosing(
       if (solved !== null && solved !== doses[chIdx].targetValue) {
         const CC = 'Calcium Chloride (100%)';
         if (solved > doses[chIdx].targetValue) {
-          // Raise CH (corrosive LSI) — cap to visit-limit and target max
+          // Raise CH (corrosive LSI) — cap to visit-limit and target max.
+          // Effective lb cap for THIS pool is the smaller of (per-10k limit
+          // scaled by volume) and the absolute hard cap. Convert that lb
+          // ceiling back to a CH ppm delta so the LSI solver clamps correctly.
           const chLimit = visitLimits[CC];
-          const visitLimitMax = chLimit
-            ? Math.round(input.calciumHardness + (chLimit / r(rates, CC, 0.9)) * 10)
+          const ratePerCC = r(rates, CC, 0.9);
+          const maxLbs = chLimit
+            ? Math.min(chLimit * optScale, CACL_ABSOLUTE_CAP_LBS)
+            : CACL_ABSOLUTE_CAP_LBS;
+          const maxDeltaPpm = ratePerCC > 0 && optScale > 0
+            ? (maxLbs * 10) / (ratePerCC * optScale)
             : Infinity;
+          const visitLimitMax = Math.round(input.calciumHardness + maxDeltaPpm);
           const clamped = Math.min(solved, targets.calciumHardness.max, visitLimitMax);
           if (clamped > doses[chIdx].targetValue) {
             const range = targets.calciumHardness.max - targets.calciumHardness.min;

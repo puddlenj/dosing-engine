@@ -570,6 +570,11 @@ function doseAlkalinity(
     const delta = target.ideal - current;
     const increments = delta / 10;
     const amount = round1(increments * r(rates, BICARB, 1.4) * scale);
+    // Bicarb raises pH ~0.05 per 10 ppm TA bump (Pool Spa News). Attach the
+    // side effect so projection reflects the actual chemistry — without this,
+    // a low-pH/low-TA pool gets a big bicarb dose and the report shows pH
+    // unchanged even though the chemistry says it should rise meaningfully.
+    const phBump = round1(increments * 0.05);
     return {
       chemical: BICARB,
       purpose: `Raise Total Alkalinity from ${current} to ${target.ideal} ppm`,
@@ -579,6 +584,11 @@ function doseAlkalinity(
       currentValue: current,
       targetValue: target.ideal,
       parameterName: 'Total Alkalinity',
+      secondaryAdjustment: phBump >= 0.1 ? {
+        parameterName: 'pH',
+        currentValue: currentPH,
+        targetValue: round1(currentPH + phBump),
+      } : undefined,
     };
   }
 
@@ -2566,22 +2576,27 @@ export function calculateDosing(
         const increments = newDelta / 10;
         const newAmount = round1(increments * r(rates, BICARB, 1.4) * optScale);
 
+        // Bicarb raises pH ~0.05 per 10 ppm TA bump. After LSI-optimizing the
+        // bicarb amount, recompute the secondary so projection matches the
+        // larger dose. If the original dose lacked a pH secondary, attach one
+        // — projection only reflects what's recorded on the dose object.
+        const phBump = round1((newDelta / 10) * 0.05);
+        const postBicarbPH = round1(input.pH + phBump);
+        const phSecondary = phBump >= 0.1 ? {
+          parameterName: 'pH',
+          currentValue: input.pH,
+          targetValue: postBicarbPH,
+          // Preserve isAdverse if it was set on the original (e.g., simultaneous-solve path)
+          ...(taDose.secondaryAdjustment?.parameterName === 'pH' && { isAdverse: taDose.secondaryAdjustment.isAdverse }),
+        } : taDose.secondaryAdjustment;
+
         doses[idx] = {
           ...taDose,
           amount: newAmount,
           targetValue: best.solvedValue,
           purpose: `Raise Total Alkalinity from ${input.totalAlkalinity} to ${best.solvedValue} ppm (LSI-optimized)`,
+          secondaryAdjustment: phSecondary,
         };
-
-        // Update bicarb's secondary pH bump
-        if (taDose.secondaryAdjustment?.parameterName === 'pH') {
-          const phBump = round1((newDelta / 10) * 0.05);
-          const postBicarbPH = round1(input.pH + phBump);
-          doses[idx].secondaryAdjustment = {
-            ...taDose.secondaryAdjustment,
-            targetValue: postBicarbPH,
-          };
-        }
 
         // Recalculate the coupled pH dose if present. This block was written for
         // bicarb+acid (TA up, pH down) coupling — recomputing acid amount for the

@@ -40,7 +40,13 @@ export const POOL_FIBERGLASS: DosingTarget = {
 export const POOL_SALT: DosingTarget = {
   ...POOL_VINYL,
   alkalinity: { min: 60, max: 80, ideal: 70 },         // TFP/PCTI: lower TA reduces pH bounce from SWG NaOH
-  calciumHardness: { min: 200, max: 400, ideal: 300 },  // CPO: 200-400; salt cell calcification risk at >400
+  // NOTE: buildTargets() does NOT apply this calciumHardness override — surface
+  // base (POOL_PLASTER / POOL_FIBERGLASS / POOL_VINYL) drives CH for salt pools
+  // because fiberglass gelcoat and vinyl can't tolerate the 300 ppm ideal that
+  // plaster benefits from. This field exists only because the DosingTarget type
+  // requires it. If you ever want salt to override CH, edit buildTargets() —
+  // editing this constant alone has no effect.
+  calciumHardness: { min: 200, max: 400, ideal: 300 },
   cya: { min: 30, max: 50, ideal: 30 },                 // TFP: 60-90 for SWG; we use 30-50 (Orenda/field pref)
   salt: { min: 2700, max: 3400, ideal: 3200 },          // Hayward/Pentair SWG manufacturer specs
 };

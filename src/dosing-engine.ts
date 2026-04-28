@@ -453,11 +453,21 @@ function adjustTargetsForLSI(input: WaterTestInput, targets: DosingTarget): Dosi
 // ─── Spa / System Detection ─────────────────────────────────────────────────
 
 function isSpa(input: WaterTestInput): boolean {
-  return (input.poolVolume ?? 0) > 0 && (input.poolVolume ?? 0) <= 1500;
+  // Residential hot tubs run 200-700 gal; larger swim spas 1500+. The 800-gal
+  // cutoff catches typical spas without grabbing dipping pools or cold plunges.
+  // Callers should pass isSpaOverride when known — this fallback only fires
+  // when the form/OCR didn't supply one.
+  return (input.poolVolume ?? 0) > 0 && (input.poolVolume ?? 0) <= 800;
 }
 
 function isBromineSystem(input: WaterTestInput): boolean {
-  return (input.bromine ?? 0) > 0;
+  // Spintouch is mode-selectable (chlorine OR bromine), so trace bromine on a
+  // chlorine pool isn't a cross-reagent issue. Real risk: stale form data,
+  // OCR mis-reads, or a tech running the wrong test. A real bromine reading
+  // sits at 3-5 ppm; require >= 0.5 ppm so the heuristic doesn't trip on noise
+  // when isBromineOverride is unset. Depleted bromine spas under 0.5 ppm need
+  // an explicit override from the form.
+  return (input.bromine ?? 0) >= 0.5;
 }
 
 // ─── Individual Dosing Functions ─────────────────────────────────────────────
@@ -617,6 +627,11 @@ function doseAlkalinity(
         currentValue: currentPH,
         targetValue: acidPHTarget,
         parameterName: 'pH',
+        // TODO: when the visit-limit splitter learns to scale secondaryAdjustment
+        // proportionally, drop skipVisitLimit so extreme acid corrections split
+        // across visits. Until then, bypass — without it, the splitter caps the
+        // dose but leaves the TA secondary projecting the full drop, lying to
+        // techs about visit results.
         skipVisitLimit: true,
         secondaryAdjustment: {
           parameterName: 'Total Alkalinity',
@@ -640,6 +655,8 @@ function doseAlkalinity(
       currentValue: currentPH,
       targetValue: acidPHTarget,
       parameterName: 'pH',
+      // TODO: same as the spa branch above — drop skipVisitLimit once the
+      // splitter scales secondaryAdjustment for split doses.
       skipVisitLimit: true,
       secondaryAdjustment: {
         parameterName: 'Total Alkalinity',
@@ -932,9 +949,11 @@ function doseShock(
   const tc = input.totalChlorine;
   if (fc === undefined || tc === undefined) return null;
 
-  // If TC < FC, readings are suspect — skip shock based on bad combined chlorine math
-  const ccl = tc - fc; // ANSI/APSP-11 2019: max CC 0.4 ppm (unified pools+spas)
-  if (ccl <= target.max) return null;
+  // If TC < FC, readings are suspect — skip shock based on bad combined chlorine math.
+  // ANSI/APSP-11 2019: shock when combined chlorine EXCEEDS 0.4 ppm — strict
+  // comparison so a borderline 0.4 reading still triggers the protocol.
+  const ccl = tc - fc;
+  if (ccl < target.max) return null;
 
   const scale = volumeGallons / 10000;
   const MPS = 'MPS Oxidizing Shock (Non-Chlorine)';
@@ -2632,16 +2651,30 @@ export function calculateDosing(
   // Walk through the dose sequence step-by-step, computing LSI after each
   // chemical addition. If any intermediate state is highly scale-forming
   // (precipitation risk), try reordering to reduce the peak.
+  //
+  // NOTE: Aeration (and other zero-amount advisory doses) are skipped here
+  // because they represent multi-visit processes, not instant chemistry
+  // changes. That means projected LSI on an aeration-prescribed visit is
+  // pessimistic — the actual pH/TA drift toward target over hours/days
+  // isn't visible until the next reading.
 
   function simulateSequence(
     doseList: ChemicalDose[],
   ): { states: IntermediateState[]; maxLSI: number } {
-    const running = {
+    // Full ProjectedValues so applyAdjustment's switch can write any param.
+    // Salt/bromine/phosphates aren't read by the LSI calc that follows, but
+    // the switch case for those parameters must have a slot to write into
+    // or tsc complains and any future read of those fields would crash.
+    const running: ProjectedValues = {
       pH: input.pH,
       totalAlkalinity: input.totalAlkalinity,
       calciumHardness: input.calciumHardness,
       cya: input.cya,
       freeChlorine: input.freeChlorine ?? 0,
+      totalChlorine: input.totalChlorine ?? 0,
+      salt: input.salt ?? 0,
+      bromine: input.bromine ?? 0,
+      phosphates: input.phosphates ?? 0,
     };
     const states: IntermediateState[] = [];
     let maxLSI = -Infinity;
